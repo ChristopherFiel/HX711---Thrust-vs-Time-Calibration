@@ -66,6 +66,7 @@ void loop() {
   if (newDataReady) {
     if (millis() > t + serialPrintInterval) {
       float i = LoadCell.getData();
+      if (i < 0) i = 0;   // clamp negative values to zero
       Serial.print("Load_cell output val: ");
       Serial.println(i);
       newDataReady = 0;

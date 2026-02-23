@@ -1,14 +1,8 @@
 /*
-  Static Thrust Test Logger
-  - Based on HX711_ADC example you provided
-  - Clamps negative load readings to 0.00
-  - Prints time in seconds (3 decimals) and load (2 decimals)
-  - Two output modes: human-readable and CSV (CSV is suitable for Excel/Python)
-  - Default sampling rate: 100 Hz (can be changed from serial)
-  - Serial commands: t= tare, r= recalibrate, c= change cal factor, m=toggle mode, f= set sample freq, h=help
-  - Saves calibration to EEPROM (same address = 0)
-
-  Compile with: Arduino IDE + HX711_ADC library
+   -------------------------------------------------------------------------------------
+   HX711_ADC
+   Modified for Static Propulsion Testing
+   -------------------------------------------------------------------------------------
 */
 
 #include <HX711_ADC.h>
@@ -16,180 +10,114 @@
 #include <EEPROM.h>
 #endif
 
-// pins
-const int HX711_dout = 4; // MCU -> HX711 DOUT
-const int HX711_sck  = 5; // MCU -> HX711 SCK
+// Pins:
+const int HX711_dout = 4; // MCU > HX711 dout pin
+const int HX711_sck = 5;  // MCU > HX711 sck pin
 
+// HX711 constructor:
 HX711_ADC LoadCell(HX711_dout, HX711_sck);
 
-const int calVal_eepromAdress = 0; // EEPROM address to store calibration
-unsigned long startTimeMs = 0;
-unsigned long lastSampleMs = 0;
-unsigned long sampleIntervalMs = 10; // default 10 ms => 100 Hz
-
-bool csvMode = false; // false = human readable, true = csv
-bool printingHeader = false;
-
-// helper: clamp negative to zero
-float clampZero(float v) {
-  if (v < 0.0f) return 0.0f;
-  return v;
-}
+const int calVal_eepromAdress = 0;
+unsigned long t = 0;
+bool lastButtonState = HIGH; // For button debouncing/state tracking
 
 void setup() {
-  Serial.begin(57600);
-  delay(10);
+  Serial.begin(57600); delay(10);
+  
+  // Setup hardware tare button
+  pinMode(TARE_BUTTON_PIN, INPUT_PULLUP); 
+
   Serial.println();
-  Serial.println("Starting HX711 Static Thrust Logger...");
+  Serial.println("Starting Setup...");
 
   LoadCell.begin();
-  unsigned long stabilizingtime = 2000; // ms
-  boolean _tare = true;
+  unsigned long stabilizingtime = 2000; 
+  boolean _tare = true; 
   LoadCell.start(stabilizingtime, _tare);
+  
   if (LoadCell.getTareTimeoutFlag() || LoadCell.getSignalTimeoutFlag()) {
-    Serial.println("Timeout, check wiring and pins");
+    Serial.println("Timeout, check MCU>HX711 wiring and pin designations");
     while (1);
-  } else {
-    // try to read saved calibration from EEPROM
-    float savedCal = 1.0;
-#if defined(ESP8266)|| defined(ESP32)
-    EEPROM.begin(512);
-#endif
-    EEPROM.get(calVal_eepromAdress, savedCal);
-    if (!isnan(savedCal) && savedCal != 0.0) {
-      LoadCell.setCalFactor(savedCal);
-      Serial.print("Loaded calFactor from EEPROM: ");
-      Serial.println(savedCal, 6);
+  }
+  else {
+    // Attempt to read the saved calibration value from EEPROM
+    float calValue;
+    EEPROM.get(calVal_eepromAdress, calValue);
+    
+    // If EEPROM has a valid-looking float, use it. Otherwise default to 1.0
+    if (calValue != 0.0 && !isnan(calValue)) {
+      LoadCell.setCalFactor(calValue);
+      Serial.print("Loaded calibration value from EEPROM: ");
+      Serial.println(calValue);
     } else {
-      LoadCell.setCalFactor(1.0);
-      Serial.println("Using default calFactor = 1.0 (no EEPROM value found)");
+      LoadCell.setCalFactor(1.0); 
+      Serial.println("No valid calibration found. Defaulting to 1.0.");
     }
-
-    Serial.println("Startup complete");
+    Serial.println("Startup is complete");
   }
-
-  // wait for the first dataset
   while (!LoadCell.update());
-
-  // run calibration routine on first run
-  calibrate();
-
-  // set start time AFTER calibration so t=0 aligns with post-calibration
-  startTimeMs = millis();
-  lastSampleMs = startTimeMs;
-
-  printHelp();
-
-  // optionally print CSV header immediately if csvMode true
-  if (csvMode && !printingHeader) {
-    Serial.println("time_s,load");
-    printingHeader = true;
-  }
+  
+  // Print the CSV Header for data logging
+  Serial.println("Time(ms),Thrust");
 }
 
 void loop() {
-  // update HX711 (non-blocking)
-  if (LoadCell.update()) {
-    // nothing else here; we use timed sampling below
+  static boolean newDataReady = 0;
+
+  // 1. Check Hardware Tare Button
+  bool currentButtonState = digitalRead(TARE_BUTTON_PIN);
+  if (currentButtonState == LOW && lastButtonState == HIGH) {
+    LoadCell.tareNoDelay(); // Zero the load cell
   }
+  lastButtonState = currentButtonState;
 
-  // sample at requested rate
-  unsigned long now = millis();
-  if (now - lastSampleMs >= sampleIntervalMs) {
-    lastSampleMs += sampleIntervalMs; // keep consistent spacing
+  // 2. Check for new data/start next conversion:
+  if (LoadCell.update()) newDataReady = true;
 
-    float rawLoad = LoadCell.getData(); // already smoothed by library
-    float load = clampZero(rawLoad);
-
-    float timeSec = (now - startTimeMs) / 1000.0f;
-
-    if (csvMode) {
-      // CSV: time_s,load (ready to paste into spreadsheet)
-      Serial.print(timeSec, 3);
+  // 3. Output Data in CSV Format (Time, Thrust)
+  if (newDataReady) {
+      float thrust = LoadCell.getData();
+      unsigned long currentTime = millis();
+      
+      Serial.print(currentTime);
       Serial.print(",");
-      Serial.println(load, 2);
-    } else {
-      // Human readable: t = 0.123 s    Load = 12.34
-      Serial.print("t = ");
-      Serial.print(timeSec, 4);
-      Serial.print(" s\t");
-      Serial.print("Force(N) = ");
-      Serial.println(load, 4);
-    }
+      Serial.println(thrust);
+      
+      newDataReady = 0;
   }
 
-  // check serial commands
+  // 4. Receive command from serial terminal (for calibration/settings)
   if (Serial.available() > 0) {
     char inByte = Serial.read();
-    // consume any trailing newline characters
-    while (Serial.available() > 0 && (Serial.peek() == '\n' || Serial.peek() == '\r')) Serial.read();
-
-    switch (inByte) {
-      case 't':
-        Serial.println("Tare requested");
-        LoadCell.tareNoDelay();
-        break;
-      case 'r':
-        Serial.println("Recalibrate requested");
-        calibrate();
-        // reset start time after recalibration so t=0 after new cal
-        startTimeMs = millis();
-        lastSampleMs = startTimeMs;
-        break;
-      case 'c':
-        changeSavedCalFactor();
-        break;
-      case 'm':
-        csvMode = !csvMode;
-        Serial.print("Mode toggled. CSV mode = "); Serial.println(csvMode ? "ON" : "OFF");
-        if (csvMode && !printingHeader) {
-          Serial.println("time_s,load");
-          printingHeader = true;
-        }
-        break;
-      case 'f':
-        Serial.println("Enter sample frequency in Hz (e.g. 100)");
-        // wait for a float/integer from serial
-        {
-          unsigned long startWait = millis();
-          while (millis() - startWait < 5000 && Serial.available() == 0) { /* wait up to 5s */ }
-          if (Serial.available() > 0) {
-            float newHz = Serial.parseFloat();
-            if (newHz > 0.0) {
-              sampleIntervalMs = (unsigned long)(1000.0f / newHz);
-              Serial.print("Sample rate set to: "); Serial.print(newHz, 1); Serial.println(" Hz");
-            } else {
-              Serial.println("Invalid frequency, ignored");
-            }
-          } else {
-            Serial.println("No frequency received, ignored");
-          }
-        }
-        break;
-      case 'h':
-        printHelp();
-        break;
-      default:
-        // ignore unknown single-byte commands
-        break;
-    }
+    if (inByte == 't') LoadCell.tareNoDelay(); // tare
+    else if (inByte == 'r') calibrate(); // calibrate
+    else if (inByte == 'c') changeSavedCalFactor(); // edit calibration value manually
   }
 
-  // optional short delay to yield CPU (not to affect sampling timing above)
-  delay(1);
+  // 5. Check if last tare operation is complete
+  if (LoadCell.getTareStatus() == true) {
+    Serial.println("Tare complete");
+    Serial.println("Time(ms),Thrust"); // Reprint header after tare info
+  }
 }
 
+// -------------------------------------------------------------------
+// CALIBRATION FUNCTIONS (Unchanged from your original code)
+// -------------------------------------------------------------------
+
 void calibrate() {
-  Serial.println("*** Start calibration procedure");
-  Serial.println("Place the load cell on a stable surface with no load.");
-  Serial.println("Send 't' from serial monitor to tare.");
+  Serial.println("***");
+  Serial.println("Start calibration:");
+  Serial.println("Place the load cell an a level stable surface.");
+  Serial.println("Remove any load applied to the load cell.");
+  Serial.println("Send 't' from serial monitor to set the tare offset.");
 
   boolean _resume = false;
   while (_resume == false) {
     LoadCell.update();
     if (Serial.available() > 0) {
-      char inByte = Serial.read();
-      if (inByte == 't') LoadCell.tareNoDelay();
+        char inByte = Serial.read();
+        if (inByte == 't') LoadCell.tareNoDelay();
     }
     if (LoadCell.getTareStatus() == true) {
       Serial.println("Tare complete");
@@ -197,7 +125,9 @@ void calibrate() {
     }
   }
 
-  Serial.println("Now place a known mass on the load cell and send its mass (e.g. 100.0)");
+  Serial.println("Now, place your known mass on the loadcell.");
+  Serial.println("Then send the weight of this mass (i.e. 100.0) from serial monitor.");
+
   float known_mass = 0;
   _resume = false;
   while (_resume == false) {
@@ -205,20 +135,22 @@ void calibrate() {
     if (Serial.available() > 0) {
       known_mass = Serial.parseFloat();
       if (known_mass != 0) {
-        Serial.print("Known mass is: "); Serial.println(known_mass);
+        Serial.print("Known mass is: ");
+        Serial.println(known_mass);
         _resume = true;
       }
     }
   }
 
-  LoadCell.refreshDataSet();
+  LoadCell.refreshDataSet(); 
   float newCalibrationValue = LoadCell.getNewCalibration(known_mass);
 
   Serial.print("New calibration value has been set to: ");
-  Serial.println(newCalibrationValue, 6);
-  Serial.print("Save this value to EEPROM address ");
+  Serial.print(newCalibrationValue);
+  Serial.println(", use this as calibration value (calFactor) in your project sketch.");
+  Serial.print("Save this value to EEPROM adress ");
   Serial.print(calVal_eepromAdress);
-  Serial.println("? (y/n)");
+  Serial.println("? y/n");
 
   _resume = false;
   while (_resume == false) {
@@ -233,9 +165,12 @@ void calibrate() {
         EEPROM.commit();
 #endif
         EEPROM.get(calVal_eepromAdress, newCalibrationValue);
-        Serial.print("Value "); Serial.print(newCalibrationValue, 6);
-        Serial.print(" saved to EEPROM address: "); Serial.println(calVal_eepromAdress);
+        Serial.print("Value ");
+        Serial.print(newCalibrationValue);
+        Serial.print(" saved to EEPROM address: ");
+        Serial.println(calVal_eepromAdress);
         _resume = true;
+
       }
       else if (inByte == 'n') {
         Serial.println("Value not saved to EEPROM");
@@ -246,27 +181,32 @@ void calibrate() {
 
   Serial.println("End calibration");
   Serial.println("***");
+  Serial.println("Time(ms),Thrust"); // Resume CSV format
 }
 
 void changeSavedCalFactor() {
   float oldCalibrationValue = LoadCell.getCalFactor();
   boolean _resume = false;
-  Serial.println("*** Change calibration factor");
-  Serial.print("Current value is: "); Serial.println(oldCalibrationValue, 6);
-  Serial.println("Send the new value from serial monitor, e.g. 696.0");
+  Serial.println("***");
+  Serial.print("Current value is: ");
+  Serial.println(oldCalibrationValue);
+  Serial.println("Now, send the new value from serial monitor, i.e. 696.0");
   float newCalibrationValue;
   while (_resume == false) {
     if (Serial.available() > 0) {
       newCalibrationValue = Serial.parseFloat();
       if (newCalibrationValue != 0) {
-        Serial.print("New calibration value is: "); Serial.println(newCalibrationValue, 6);
+        Serial.print("New calibration value is: ");
+        Serial.println(newCalibrationValue);
         LoadCell.setCalFactor(newCalibrationValue);
         _resume = true;
       }
     }
   }
   _resume = false;
-  Serial.print("Save this value to EEPROM address "); Serial.print(calVal_eepromAdress); Serial.println("? y/n");
+  Serial.print("Save this value to EEPROM adress ");
+  Serial.print(calVal_eepromAdress);
+  Serial.println("? y/n");
   while (_resume == false) {
     if (Serial.available() > 0) {
       char inByte = Serial.read();
@@ -279,8 +219,10 @@ void changeSavedCalFactor() {
         EEPROM.commit();
 #endif
         EEPROM.get(calVal_eepromAdress, newCalibrationValue);
-        Serial.print("Value "); Serial.print(newCalibrationValue, 6);
-        Serial.print(" saved to EEPROM address: "); Serial.println(calVal_eepromAdress);
+        Serial.print("Value ");
+        Serial.print(newCalibrationValue);
+        Serial.print(" saved to EEPROM address: ");
+        Serial.println(calVal_eepromAdress);
         _resume = true;
       }
       else if (inByte == 'n') {
@@ -291,14 +233,5 @@ void changeSavedCalFactor() {
   }
   Serial.println("End change calibration value");
   Serial.println("***");
-}
-
-void printHelp() {
-  Serial.println("\nSerial commands:");
-  Serial.println("  t - tare (no delay)");
-  Serial.println("  r - re-run calibration routine");
-  Serial.println("  c - change calibration factor manually");
-  Serial.println("  m - toggle output mode (human-readable / CSV)");
-  Serial.println("  f - set sample frequency in Hz (follow by number)");
-  Serial.println("  h - print this help message\n");
+  Serial.println("Time(ms),Thrust"); // Resume CSV format
 }
